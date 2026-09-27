@@ -1,0 +1,22 @@
+# Build output
+build/
+*.exe
+*.dll
+*.o
+*.pak
+debug.log
+settings.ini
+
+# Library sources (тяжёлые, не нужны в git)
+libOPNMIDI/
+libADLMIDI/
+mid2vgm-beta5/
+src/
+
+# Runtime tools
+xg.wopn
+isc/
+
+# OS junk
+Thumbs.db
+.DS_Store

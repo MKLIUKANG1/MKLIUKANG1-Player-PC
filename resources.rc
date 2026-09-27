@@ -1,0 +1,2 @@
+#include "resource.h"
+IDR_PAK RCDATA "resources.pak"

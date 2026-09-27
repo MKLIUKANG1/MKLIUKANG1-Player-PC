@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="icon" type="image/png" href="./favicon.png">
+<title>MKLIUKANG1 Player</title>
+<meta property="og:title" content="MKLIUKANG1 Player">
+<meta property="og:description" content="Веб-плеер с синтезатором FluidSynth и эквалайзером.">
+<meta name="description" content="Веб-плеер с синтезатором FluidSynth и эквалайзером.">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a0c10;
+               overflow: hidden; font-family: sans-serif; color: #c0c0d0;
+               -webkit-tap-highlight-color: transparent;
+               -webkit-user-select: none; user-select: none; }
+  #c { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center;
+             justify-content: center; background: #0a0c10; color: #80a0d0;
+             font-size: 20px; z-index: 10; text-align: center; padding: 20px; }
+  #loading.hidden { display: none; }
+  #unlock { position: fixed; inset: 0; display: flex; align-items: center;
+            justify-content: center; background: rgba(10,12,16,0.95);
+            cursor: pointer; z-index: 20; }
+  #unlock.hidden { display: none; }
+  #unlock div { text-align: center; font-size: 22px; color: #80a0d0;
+                border: 2px solid #3a5a90; padding: 30px 50px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="loading">Загрузка…</div>
+<div id="unlock" class="hidden"><div>Нажмите, чтобы начать воспроизведение</div></div>
+
+<script type="module">
+// ============================================================
+//                     PAK
+// ============================================================
+async function inflateZlib(data) {
+  const ds = new DecompressionStream('deflate');
+  const stream = new Blob([data]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function loadPak(url, onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('pak not found: ' + resp.status);
+  const total = +resp.headers.get('Content-Length') || 0;
+  const reader = resp.body.getReader();
+  let received = 0;
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (onProgress && total) onProgress(received / total);
+  }
+  const buf = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+
+  const view = new DataView(buf.buffer);
+  if (String.fromCharCode(buf[0],buf[1],buf[2],buf[3]) !== 'MPAK')
+    throw new Error('bad pak magic');
+  const version = view.getUint32(4, true);
+  const count   = view.getUint32(8, true);
+  if (version !== 2) throw new Error('bad pak version ' + version);
+
+  let p = 12;
+  const entries = [];
+  const dec = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const nameLen = view.getUint32(p, true); p += 4;
+    const name = dec.decode(buf.subarray(p, p + nameLen)); p += nameLen;
+    const origSize = view.getUint32(p, true); p += 4;
+    const dataSize = view.getUint32(p, true); p += 4;
+    const flag = buf[p]; p += 1;
+    let data = buf.subarray(p, p + dataSize);
+    p += dataSize;
+    if (flag === 1) data = await inflateZlib(data);
+    entries.push({ name, data });
+  }
+  return entries;
+}
+
+// ============================================================
+//                     ИМЯ ФАЙЛА
+// ============================================================
+function cleanName(name) {
+  name = name.replace(/^(midi|soundfonts)\//, '');
+  name = name.replace(/\.[^.]+$/, '');
+  return name;
+}
+
+// ============================================================
+//                     АУДИО
+// ============================================================
+import { Sequencer, WorkletSynthesizer } from 'https://cdn.jsdelivr.net/npm/spessasynth_lib@4/+esm';
+
+let synth = null;
+let seq   = null;
+let pakEntries = [];
+let midiFiles  = [];
+let sf2Files   = [];
+let sf2Idx     = 0;
+let audioCtx   = null;
+let currentIdx = 0;
+
+async function initAudio() {
+  audioCtx = new AudioContext();
+  await audioCtx.audioWorklet.addModule(
+    'https://cdn.jsdelivr.net/npm/spessasynth_lib@4/dist/spessasynth_processor.min.js'
+  );
+  synth = new WorkletSynthesizer(audioCtx);
+  await synth.isReady;
+  synth.connect(audioCtx.destination);
+
+  seq = new Sequencer(synth);
+  seq.loopCount = 0;
+  seq.onSongEnd = () => nextTrack();
+
+  await loadSoundBank(0);
+}
+
+async function loadSoundBank(idx) {
+  if (idx < 0) idx = sf2Files.length - 1;
+  idx = idx % sf2Files.length;
+  sf2Idx = idx;
+  const f = sf2Files[idx];
+  const sfBuffer = f.data.buffer.slice(
+    f.data.byteOffset, f.data.byteOffset + f.data.byteLength);
+  await synth.soundBankManager.addSoundBank(sfBuffer, 'main');
+}
+
+function stopAllNotes() {
+  if (!synth) return;
+  try {
+    if (typeof synth.stopAllNotes === 'function') synth.stopAllNotes();
+    if (typeof synth.allNotesOff === 'function')  synth.allNotesOff();
+    if (typeof synth.controllerChange === 'function') {
+      for (let ch = 0; ch < 16; ch++) {
+        synth.controllerChange(ch, 120, 0);
+        synth.controllerChange(ch, 123, 0);
+      }
+    }
+  } catch (e) {}
+}
+
+// ---------- ПЕРЕКЛЮЧЕНИЕ ТРЕКОВ ----------
+async function playTrack(idx) {
+  if (!seq) return;
+  if (!midiFiles.length) return;
+  if (idx < 0) idx = midiFiles.length - 1;
+  idx = ((idx % midiFiles.length) + midiFiles.length) % midiFiles.length;
+
+  seq.pause();
+  stopAllNotes();
+
+  currentIdx = idx;
+  const m = midiFiles[idx];
+  const song = {
+    binary: m.data.buffer.slice(
+      m.data.byteOffset, m.data.byteOffset + m.data.byteLength),
+    fileName: m.name
+  };
+
+  await seq.loadNewSongList([song]);
+  seq.play();
+}
+
+function nextTrack() { playTrack(currentIdx + 1); }
+function prevTrack() { playTrack(currentIdx - 1); }
+
+async function nextBank() { await loadSoundBank(sf2Idx + 1); }
+async function prevBank() { await loadSoundBank(sf2Idx - 1); }
+
+// ============================================================
+//                     CANVAS
+// ============================================================
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+let W = 800, H = 600;
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+function resize() {
+  const cw = canvas.clientWidth  || window.innerWidth  || 800;
+  const ch = canvas.clientHeight || window.innerHeight || 600;
+  W = cw; H = ch;
+  canvas.width  = Math.max(1, cw * dpr);
+  canvas.height = Math.max(1, ch * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+resize();
+
+function drawText(text, x, y, size, color) {
+  ctx.fillStyle = color;
+  ctx.font = `bold ${size}px "Courier New", monospace`;
+  ctx.textBaseline = 'top';
+  ctx.fillText(text, x, y);
+}
+function textWidth(text, size) {
+  ctx.font = `bold ${size}px "Courier New", monospace`;
+  return ctx.measureText(text).width;
+}
+
+// ============================================================
+//                     ЭКВАЛАЙЗЕР
+// ============================================================
+let analyser = null;
+let eqBars = new Array(48).fill(0);
+
+function setupAnalyser() {
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  analyser.smoothingTimeConstant = 0.75;
+  synth.connect(analyser);
+  analyser.connect(audioCtx.destination);
+}
+
+function updateEq() {
+  if (!analyser) return;
+  const bins = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(bins);
+  const N = eqBars.length;
+  for (let i = 0; i < N; i++) {
+    const f0 = Math.pow(i / N, 2) * bins.length;
+    const f1 = Math.pow((i + 1) / N, 2) * bins.length;
+    const a = Math.floor(f0), b = Math.max(a + 1, Math.floor(f1));
+    let sum = 0, cnt = 0;
+    for (let j = a; j < b && j < bins.length; j++) { sum += bins[j]; cnt++; }
+    const v = cnt ? (sum / cnt) / 255 : 0;
+    const target = Math.pow(v, 1.3);
+    eqBars[i] += (target - eqBars[i]) * (target > eqBars[i] ? 0.5 : 0.15);
+    if (eqBars[i] < 0.01) eqBars[i] = 0.01;
+  }
+}
+
+function drawEqualizer(x, y, w, h) {
+  ctx.fillStyle = 'rgba(18,22,34,0.9)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(90,140,220,0.7)';
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+
+  const N = eqBars.length;
+  const gap = 2;
+  const barW = (w - (N + 1) * gap) / N;
+  for (let i = 0; i < N; i++) {
+    const bh = Math.max(2, eqBars[i] * (h - 12));
+    const bx = x + gap + i * (barW + gap);
+    const by = y + h - 6 - bh;
+    const t = bh / h;
+    let R, G, B;
+    if (t < 0.55) { R = Math.floor(t / 0.55 * 255); G = 230; B = 70; }
+    else          { R = 255; G = Math.floor((1 - (t - 0.55) / 0.45) * 230); B = 60; }
+    ctx.fillStyle = `rgb(${R},${G},${B})`;
+    ctx.fillRect(bx, by, barW, bh);
+  }
+}
+
+// ============================================================
+//                     ИНТЕРФЕЙС
+// ============================================================
+let lang = 'EN';
+const STR = {
+  EN: { now: 'NOW PLAYING', track: 'TRACK', engine: 'SOUND ENGINE',
+        hint: 'UP/DN: TRACK  L/R: BANK  SPACE: PAUSE  L: LANG' },
+  RU: { now: 'СЕЙЧАС ИГРАЕТ', track: 'ТРЕК', engine: 'ЗВУК. ДВИЖОК',
+        hint: '↑/↓: ТРЕК  ←/→: БАНК  ПРОБЕЛ: ПАУЗА  L: ЯЗЫК' }
+};
+
+let btnRects = {};
+
+function drawInterface(t) {
+  if (W <= 0 || H <= 0) resize();
+
+  ctx.clearRect(0, 0, W, H);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0e1220');
+  g.addColorStop(1, '#06080f');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = '#2d78dc';
+  ctx.fillRect(0, 0, W, 3);
+
+  const S = STR[lang];
+
+  drawText(S.now, 24, 20, 14, '#5a8cd2');
+  drawText(lang, W - 40, 20, 14, '#90b0e0');
+
+  let title = '—';
+  if (midiFiles.length > 0 && currentIdx >= 0 && currentIdx < midiFiles.length) {
+    title = cleanName(midiFiles[currentIdx].name);
+  }
+
+  const titleScale = W >= 900 ? 42 : (W >= 600 ? 30 : 24);
+  const maxTitleW = W - 48;
+  const tw = textWidth(title, titleScale);
+  if (tw > maxTitleW && title !== '—') {
+    const offset = ((t / 60) % (tw + 200));
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(24, 52, maxTitleW, titleScale + 10);
+    ctx.clip();
+    drawText(title, 24 - offset, 52, titleScale, '#f0f5ff');
+    drawText(title, 24 - offset + tw + 200, 52, titleScale, '#f0f5ff');
+    ctx.restore();
+  } else {
+    drawText(title, 24, 52, titleScale, '#f0f5ff');
+  }
+
+  const pos = midiFiles.length
+    ? `${S.track} ${currentIdx + 1}/${midiFiles.length}` : '';
+  drawText(pos, 24, 52 + titleScale + 12, 14, '#78aaf0');
+
+  const eqX = 24;
+  const eqY = 52 + titleScale + 40;
+  const eqW = W - 48;
+  const eqH = Math.max(60, H - eqY - (isTouch ? 160 : 100));
+  drawEqualizer(eqX, eqY, eqW, eqH);
+
+  const sfName = sf2Files.length ? cleanName(sf2Files[sf2Idx].name) : '—';
+  drawText(S.engine + ': ' + sfName, 24, H - (isTouch ? 140 : 80), 14, '#5a8cd2');
+
+  // ---------- Кнопки для тача ----------
+  if (isTouch) {
+    const BTN = Math.min(72, Math.floor(H * 0.14));
+    const GAP = Math.min(24, Math.floor(W * 0.04));
+    const totalW = BTN * 3 + GAP * 2;
+    const startX = (W - totalW) / 2;
+    const btnY = H - BTN - 16;
+
+    btnRects = {
+      prev: { x: startX,                     y: btnY, w: BTN, h: BTN },
+      play: { x: startX + BTN + GAP,         y: btnY, w: BTN, h: BTN },
+      next: { x: startX + (BTN + GAP) * 2,   y: btnY, w: BTN, h: BTN },
+    };
+
+    function drawBtn(r, symbol, active) {
+      ctx.fillStyle = active ? 'rgba(50,120,220,0.9)' : 'rgba(40,55,85,0.85)';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(r.x, r.y, r.w, r.h, 14);
+      else               ctx.rect(r.x, r.y, r.w, r.h);
+      ctx.fill();
+      ctx.strokeStyle = active ? '#7ab0ff' : 'rgba(90,120,180,0.7)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      const cx = r.x + r.w / 2, cy = r.y + r.h / 2, s = r.w * 0.22;
+      ctx.fillStyle = '#ffffff';
+      if (symbol === 'prev') {
+        ctx.beginPath();
+        ctx.moveTo(cx + s * 0.5, cy - s);
+        ctx.lineTo(cx - s * 0.6, cy);
+        ctx.lineTo(cx + s * 0.5, cy + s);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillRect(cx - s * 0.9, cy - s, 3, s * 2);
+      } else if (symbol === 'next') {
+        ctx.beginPath();
+        ctx.moveTo(cx - s * 0.5, cy - s);
+        ctx.lineTo(cx + s * 0.6, cy);
+        ctx.lineTo(cx - s * 0.5, cy + s);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillRect(cx + s * 0.9 - 3, cy - s, 3, s * 2);
+      } else if (symbol === 'pause') {
+        ctx.fillRect(cx - s * 0.6, cy - s, s * 0.5, s * 2);
+        ctx.fillRect(cx + s * 0.1, cy - s, s * 0.5, s * 2);
+      } else if (symbol === 'play') {
+        ctx.beginPath();
+        ctx.moveTo(cx - s * 0.5, cy - s);
+        ctx.lineTo(cx - s * 0.5, cy + s);
+        ctx.lineTo(cx + s * 0.8, cy);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    drawBtn(btnRects.prev, 'prev', false);
+    drawBtn(btnRects.play, paused ? 'play' : 'pause', paused);
+    drawBtn(btnRects.next, 'next', false);
+  }
+
+  // Подсказка — только для десктопа
+  if (!isTouch) {
+    const hintW = textWidth(S.hint, 14);
+    drawText(S.hint, Math.max(12, (W - hintW) / 2), H - 24, 14, '#6478a0');
+  }
+}
+
+// ============================================================
+//                     КЛАВИАТУРА (десктоп)
+// ============================================================
+let paused = false;
+
+window.addEventListener('keydown', async e => {
+  if (e.code === 'ArrowDown')      { await nextTrack(); paused = false; }
+  else if (e.code === 'ArrowUp')   { await prevTrack(); paused = false; }
+  else if (e.code === 'ArrowRight'){ await nextBank(); }
+  else if (e.code === 'ArrowLeft') { await prevBank(); }
+  else if (e.code === 'Space') {
+    if (paused) { seq.play(); paused = false; }
+    else        { seq.pause(); stopAllNotes(); paused = true; }
+    e.preventDefault();
+  }
+  else if (e.key === 'l' || e.key === 'L') {
+    lang = (lang === 'EN') ? 'RU' : 'EN';
+  }
+});
+
+// ============================================================
+//                     ТАЧ (мобильные)
+// ============================================================
+let tx0 = 0, ty0 = 0, tt0 = 0;
+let touchHandled = false;
+
+function hitTest(x, y, r) {
+  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+function getCanvasPos(touch) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: touch.clientX - rect.left,
+    y: touch.clientY - rect.top
+  };
+}
+
+canvas.addEventListener('touchstart', e => {
+  const t = e.touches[0];
+  const p = getCanvasPos(t);
+  tx0 = t.clientX;
+  ty0 = t.clientY;
+  tt0 = performance.now();
+  touchHandled = false;
+
+  if (isTouch) {
+    for (const [key, r] of Object.entries(btnRects)) {
+      if (hitTest(p.x, p.y, r)) {
+        touchHandled = true;
+        if (key === 'prev') { prevTrack(); paused = false; }
+        if (key === 'next') { nextTrack(); paused = false; }
+        if (key === 'play') {
+          if (paused) { seq.play(); paused = false; }
+          else        { seq.pause(); stopAllNotes(); paused = true; }
+        }
+        break;
+      }
+    }
+  }
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  if (touchHandled) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - tx0;
+  const dy = t.clientY - ty0;
+  const dt = performance.now() - tt0;
+
+  if (dt < 500 && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 60) {
+    if (dy > 0) { prevTrack(); paused = false; }
+    else        { nextTrack(); paused = false; }
+  }
+  else if (dt < 500 && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 60) {
+    if (dx > 0) nextBank();
+    else        prevBank();
+  }
+  else if (dt < 300 && Math.abs(dx) < 20 && Math.abs(dy) < 20) {
+    const p = getCanvasPos(t);
+    const btnTop = H - 72 - 16;
+    if (p.y < btnTop - 10) {
+      if (paused) { seq.play(); paused = false; }
+      else        { seq.pause(); stopAllNotes(); paused = true; }
+    }
+  }
+  e.preventDefault();
+}, { passive: false });
+
+// ============================================================
+//                     ЦИКЛ
+// ============================================================
+function frame() {
+  updateEq();
+  drawInterface(performance.now());
+  requestAnimationFrame(frame);
+}
+
+// ============================================================
+//                     СТАРТ
+// ============================================================
+async function start() {
+  const loadingEl = document.getElementById('loading');
+  try {
+    loadingEl.textContent = 'Загрузка resources.pak…';
+    pakEntries = await loadPak('./resources.pak', r => {
+      loadingEl.textContent = `Загрузка resources.pak… ${(r * 100) | 0}%`;
+    });
+
+    midiFiles = pakEntries.filter(e => e.name.startsWith('midi/'));
+    sf2Files  = pakEntries.filter(e => e.name.startsWith('soundfonts/'));
+    if (!midiFiles.length) throw new Error('нет midi в pak');
+    if (!sf2Files.length)  throw new Error('нет soundfonts в pak');
+
+    loadingEl.textContent = 'Инициализация аудио…';
+    await initAudio();
+    setupAnalyser();
+
+    loadingEl.classList.add('hidden');
+    document.getElementById('unlock').classList.remove('hidden');
+
+    resize();
+    frame();
+  } catch (err) {
+    loadingEl.textContent = 'Ошибка: ' + err.message;
+    console.error(err);
+  }
+}
+
+document.getElementById('unlock').addEventListener('click', async () => {
+  document.getElementById('unlock').classList.add('hidden');
+  await audioCtx.resume();
+  await playTrack(0);
+  paused = false;
+}, { once: true });
+
+document.getElementById('unlock').addEventListener('touchend', async (e) => {
+  e.preventDefault();
+  document.getElementById('unlock').classList.add('hidden');
+  await audioCtx.resume();
+  await playTrack(0);
+  paused = false;
+}, { once: true });
+
+start();
+</script>
+</body>
+</html>

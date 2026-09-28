@@ -379,6 +379,12 @@ static std::string unpack_pak_to_temp() {
     std::string dir = "/tmp/MidiPlayer";
 #endif
     std::error_code ec;
+
+    // ВАЖНО: сначала удаляем старую распаковку,
+    // чтобы не было конфликтов между версиями
+    fs::remove_all(dir, ec);
+    std::cout << "[pak] cleaned temp dir: " << dir << "\n";
+
     fs::create_directories(dir, ec);
     for (auto& e : g_pack.entries()) {
         fs::path out_path = fs::path(dir) / e.name;

@@ -1,9 +1,12 @@
 # Build output
 build/
+build-vgm/
 *.exe
 *.dll
 *.o
 *.pak
+*.vgm
+*.vgz
 debug.log
 settings.ini
 
@@ -20,3 +23,4 @@ isc/
 # OS junk
 Thumbs.db
 .DS_Store
+MKLIUKANG1_Player_PC_*.zip
